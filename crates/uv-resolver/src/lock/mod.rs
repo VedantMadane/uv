@@ -2495,12 +2495,11 @@ impl Lock {
             )
         };
         if missing_metadata
-            && (!self.manifest.constraints.is_empty()
-                || self
-                    .manifest
-                    .dependency_groups
-                    .values()
-                    .any(|requirements| !requirements.is_empty()))
+            && self
+                .manifest
+                .dependency_groups
+                .values()
+                .any(|requirements| !requirements.is_empty())
         {
             return Ok(mismatch(Vec::new(), &package.dependencies));
         }
@@ -2659,7 +2658,7 @@ impl Lock {
         }
 
         // Validate that the lockfile was generated with the same constraints.
-        {
+        let normalized_constraints = {
             let expected: BTreeSet<_> = constraints
                 .iter()
                 .cloned()
@@ -2675,7 +2674,8 @@ impl Lock {
             if expected != actual {
                 return Ok(SatisfiesResult::MismatchedConstraints(expected, actual));
             }
-        }
+            expected
+        };
 
         // Validate that the lockfile was generated with the same overrides.
         let normalized_overrides = {
@@ -2816,6 +2816,7 @@ impl Lock {
         };
         let dependency_sources = if allow_missing_package_metadata {
             Box::pin(self.collect_dependency_sources(
+                normalized_constraints,
                 &dependency_overrides,
                 &dependency_excludes,
                 root,
@@ -3297,6 +3298,50 @@ impl Lock {
         Ok(SatisfiesResult::Satisfied)
     }
 
+    /// Return whether an authorized direct source selects this package in the active context.
+    fn constraint_selects_source(
+        package: &Package,
+        marker: MarkerTree,
+        constraints: &BTreeSet<Requirement>,
+        root: &Path,
+    ) -> Result<bool, LockError> {
+        for constraint in constraints {
+            if constraint.name == package.id.name
+                && !matches!(constraint.source, RequirementSource::Registry { .. })
+                && !marker.and(constraint.marker).is_false()
+                && package
+                    .id
+                    .source
+                    .satisfies_requirement_source(&constraint.source, root)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Return whether an exact locked source is reachable where its declaration applies.
+    fn source_is_reachable(
+        &self,
+        requirement: &Requirement,
+        package_markers: &FxHashMap<(&PackageId, Option<&ExtraName>), MarkerTree>,
+        root: &Path,
+    ) -> Result<bool, LockError> {
+        for package in self.packages_for_name(&requirement.name) {
+            if package_markers
+                .get(&(&package.id, None))
+                .is_some_and(|marker| !marker.and(requirement.marker).is_false())
+                && package
+                    .id
+                    .source
+                    .satisfies_requirement_source(&requirement.source, root)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Match a requirement's version and any explicitly declared source.
     fn package_satisfies_requirement(
         package: &Package,
@@ -3406,6 +3451,7 @@ impl Lock {
     /// Collect reachable direct sources without trusting stale locked edges.
     async fn collect_dependency_sources<Context: BuildContext>(
         &self,
+        mut source_requirements: BTreeSet<Requirement>,
         dependency_overrides: &Overrides,
         dependency_excludes: &Excludes,
         root: &Path,
@@ -3465,7 +3511,11 @@ impl Lock {
                 } else if matches!(
                     package.id.source,
                     Source::Path(..) | Source::Direct(..) | Source::Git(..)
-                ) {
+                ) || matches!(package.id.source, Source::Registry(..))
+                    && source_requirements.iter().any(|constraint| {
+                        !matches!(constraint.source, RequirementSource::Registry { .. })
+                    })
+                {
                     None
                 } else {
                     continue;
@@ -3539,6 +3589,17 @@ impl Lock {
                                         .id
                                         .source
                                         .satisfies_requirement_source(&requirement.source, root)?
+                                    && !Self::constraint_selects_source(
+                                        dependency,
+                                        marker
+                                            .and(requirement_context.conflict_marker(
+                                                &package.id.name,
+                                                &self.conflicts,
+                                            ))
+                                            .and(requirement_marker),
+                                        &source_requirements,
+                                        root,
+                                    )?
                             {
                                 continue;
                             }
@@ -3625,9 +3686,23 @@ impl Lock {
                         if marker.is_false() {
                             continue;
                         }
+                        let registry_external_source =
+                            matches!(package.id.source, Source::Registry(..))
+                                && !matches!(dependency_package.id.source, Source::Registry(..));
+                        let constrained_source = registry_external_source
+                            && Self::constraint_selects_source(
+                                dependency_package,
+                                marker,
+                                &source_requirements,
+                                root,
+                            )?;
+                        if registry_external_source && !constrained_source {
+                            continue;
+                        }
                         if refreshed_dependencies.is_none()
                             && dependency_package.id.source.is_source_tree()
                             && !self.is_workspace_package(dependency_package)
+                            && !constrained_source
                         {
                             // Opaque providers cannot authorize inspecting an inherited
                             // local edge. Preserve its candidate contexts so a refreshed,
@@ -3646,10 +3721,26 @@ impl Lock {
             }
         }
 
+        // Constraints may select an already-reachable source, but cannot introduce packages.
+        // Drop inactive entries before a deleted archive or stale local tree could be inspected.
+        let mut pending_sources = Vec::<Requirement>::new();
+        let mut inactive_constraints = Vec::new();
+        for constraint in source_requirements
+            .iter()
+            .filter(|constraint| !matches!(constraint.source, RequirementSource::Registry { .. }))
+        {
+            if self.source_is_reachable(constraint, &package_markers, root)? {
+                pending_sources.push(constraint.clone());
+            } else {
+                inactive_constraints.push(constraint.clone());
+            }
+        }
+        for constraint in inactive_constraints {
+            source_requirements.remove(&constraint);
+        }
+
         // Inspect archives or invoke local backends only after an active declaration selects
         // their exact reachable path. URL and Git providers use only retained lock metadata.
-        let mut source_requirements = BTreeSet::new();
-        let mut pending_sources = Vec::<Requirement>::new();
         let mut pending_packages = self
             .packages
             .iter()
